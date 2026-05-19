@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{self, Write};
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -394,21 +395,31 @@ async fn fetch_shows(query: &str) -> Result<(), Box<dyn Error>> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
+    let input: String;
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <query>", args[0]);
-        eprintln!("       {} -c", args[0]);
-        std::process::exit(1);
+        print!("\x1b[1;36mEnter search query: \x1b[0m");
+        io::stdout().flush().unwrap();
+
+        let mut user_input = String::new();
+        io::stdin()
+            .read_line(&mut user_input)
+            .expect("Failed to read line");
+        input = user_input.trim().to_string();
+
+        if input.is_empty() {
+            eprintln!("\x1b[31mNo query provided. Exiting.\x1b[0m");
+            std::process::exit(1);
+        }
+    } else {
+        input = args[1].clone();
     }
-
-    let input = &args[1];
-
     if input == "-c" {
         if let Err(e) = continue_watching().await {
             eprintln!("Application Error: {}", e);
         }
     } else {
-        if let Err(e) = fetch_shows(input).await {
+        if let Err(e) = fetch_shows(&input).await {
             eprintln!("Application Error: {}", e);
         }
     }
