@@ -1,13 +1,12 @@
+use reqwest::Client;
+use scraper::{Html, Selector};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-
-use reqwest::Client;
-use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 struct Body {
@@ -34,6 +33,14 @@ struct HistoryItem {
     show_name: String,
     episode_title: String,
     url: String,
+}
+
+enum PostPlayAction {
+    Next,
+    Prev,
+    Replay,
+    Episodes,
+    Quit,
 }
 
 fn get_history_path() -> PathBuf {
@@ -97,8 +104,7 @@ fn select_history_with_fzf(history: &[HistoryItem]) -> Result<Option<HistoryItem
         .arg("--layout=reverse")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start fzf.");
+        .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(fzf_input.as_bytes())?;
@@ -121,24 +127,22 @@ fn select_history_with_fzf(history: &[HistoryItem]) -> Result<Option<HistoryItem
     Ok(None)
 }
 
-fn continue_watching() -> Result<(), Box<dyn Error>> {
+async fn continue_watching() -> Result<(), Box<dyn Error>> {
     let history = load_history();
 
     if history.is_empty() {
-        println!("Your watch history is empty. Go watch something first!");
+        println!("Your watch history is empty.");
         return Ok(());
     }
 
     match select_history_with_fzf(&history)? {
         Some(selected_item) => {
-            println!(
-                "\nResuming: {} - {}",
-                selected_item.show_name, selected_item.episode_title
-            );
-
-            if let Err(e) = play_video(&selected_item.url) {
-                eprintln!("Failed to play video: {}", e);
-            }
+            handle_show(
+                &selected_item.show_id,
+                &selected_item.show_name,
+                Some(&selected_item.episode_title),
+            )
+            .await?;
         }
         None => {
             println!("\nResume canceled.");
@@ -148,23 +152,24 @@ fn continue_watching() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn play_video(url: &str) -> Result<(), Box<dyn Error>> {
+fn play_video(url: &str) -> Result<Option<std::process::Child>, Box<dyn Error>> {
     let is_termux = env::var("TERMUX_VERSION").is_ok();
-    let mut player;
 
     if is_termux {
-        println!("Detected Termux. Launching Android player...");
-        player = Command::new("termux-open");
+        let mut player = Command::new("termux-open");
         player.arg(url);
+        player.spawn()?;
+        Ok(None)
     } else {
-        println!("Desktop environment detected. Launching mpv...");
-        player = Command::new("mpv");
+        let mut player = Command::new("mpv");
         player.arg("--save-position-on-quit");
         player.arg(url);
-    }
+        player.stdout(Stdio::null());
+        player.stderr(Stdio::null());
 
-    player.spawn()?.wait()?;
-    Ok(())
+        let child = player.spawn()?;
+        Ok(Some(child))
+    }
 }
 
 fn select_show_with_fzf(shows: &[Show]) -> Result<Option<Show>, Box<dyn Error>> {
@@ -181,8 +186,7 @@ fn select_show_with_fzf(shows: &[Show]) -> Result<Option<Show>, Box<dyn Error>> 
         .arg("--prompt=Select a show: ")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start fzf. Is it installed?");
+        .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(fzf_input.as_bytes())?;
@@ -196,7 +200,8 @@ fn select_show_with_fzf(shows: &[Show]) -> Result<Option<Show>, Box<dyn Error>> 
     }
 
     if let Some(selected_id) = selection.split(" | ").next() {
-        if let Some(selected_show) = shows.iter().find(|s| s.id == selected_id) {
+        let clean_id = selected_id.trim();
+        if let Some(selected_show) = shows.iter().find(|s| s.id == clean_id) {
             return Ok(Some(selected_show.clone()));
         }
     }
@@ -206,8 +211,6 @@ fn select_show_with_fzf(shows: &[Show]) -> Result<Option<Show>, Box<dyn Error>> 
 
 async fn scrape_episodes(play_id: &str) -> Result<Vec<Episode>, Box<dyn Error>> {
     let url = format!("http://10.16.100.244/player.php?play={}", play_id);
-    println!("Fetching player page: {}\n", url);
-
     let html_content = reqwest::get(&url).await?.text().await?;
 
     let document = Html::parse_document(&html_content);
@@ -244,8 +247,7 @@ fn select_episode_with_fzf(episodes: &[Episode]) -> Result<Option<Episode>, Box<
         .arg("--layout=reverse")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
-        .expect("Failed to start fzf.");
+        .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(fzf_input.as_bytes())?;
@@ -265,6 +267,106 @@ fn select_episode_with_fzf(episodes: &[Episode]) -> Result<Option<Episode>, Box<
     Ok(None)
 }
 
+fn post_play_menu(current_idx: usize, total_eps: usize) -> Result<PostPlayAction, Box<dyn Error>> {
+    let mut options = Vec::new();
+
+    if current_idx + 1 < total_eps {
+        options.push("Next Episode");
+    }
+    if current_idx > 0 {
+        options.push("Previous Episode");
+    }
+
+    options.push("Replay");
+    options.push("Select Another Episode");
+    options.push("Quit");
+
+    let fzf_input = options.join("\n") + "\n";
+
+    let mut child = Command::new("fzf")
+        .arg("--prompt=▶ Playing: ")
+        .arg("--layout=reverse")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(fzf_input.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    let selection = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    match selection.as_str() {
+        "Next Episode" => Ok(PostPlayAction::Next),
+        "Previous Episode" => Ok(PostPlayAction::Prev),
+        "Replay" => Ok(PostPlayAction::Replay),
+        "Select Another Episode" => Ok(PostPlayAction::Episodes),
+        _ => Ok(PostPlayAction::Quit),
+    }
+}
+
+async fn handle_show(
+    show_id: &str,
+    show_name: &str,
+    initial_episode_title: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let episodes = scrape_episodes(show_id).await?;
+
+    if episodes.is_empty() {
+        println!("No video links found.");
+        return Ok(());
+    }
+
+    let mut current_idx = match initial_episode_title {
+        Some(title) => episodes.iter().position(|e| e.title == title).unwrap_or(0),
+        None => match select_episode_with_fzf(&episodes)? {
+            Some(ep) => episodes.iter().position(|e| e.title == ep.title).unwrap(),
+            None => return Ok(()),
+        },
+    };
+
+    loop {
+        let current_ep = &episodes[current_idx];
+
+        let current_watch = HistoryItem {
+            show_id: show_id.to_string(),
+            show_name: show_name.to_string(),
+            episode_title: current_ep.title.clone(),
+            url: current_ep.url.clone(),
+        };
+
+        let _ = save_history(current_watch);
+
+        let child_opt = match play_video(&current_ep.url) {
+            Ok(child) => child,
+            Err(_) => break,
+        };
+
+        let action = post_play_menu(current_idx, episodes.len())?;
+
+        if let Some(mut child) = child_opt {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        match action {
+            PostPlayAction::Next => current_idx += 1,
+            PostPlayAction::Prev => current_idx -= 1,
+            PostPlayAction::Replay => continue,
+            PostPlayAction::Episodes => match select_episode_with_fzf(&episodes)? {
+                Some(ep) => {
+                    current_idx = episodes.iter().position(|e| e.title == ep.title).unwrap()
+                }
+                None => break,
+            },
+            PostPlayAction::Quit => break,
+        }
+    }
+
+    Ok(())
+}
+
 async fn fetch_shows(query: &str) -> Result<(), Box<dyn Error>> {
     let client = Client::new();
     let url = "http://10.16.100.244/command.php";
@@ -279,43 +381,12 @@ async fn fetch_shows(query: &str) -> Result<(), Box<dyn Error>> {
 
         match select_show_with_fzf(&shows)? {
             Some(selected_show) => {
-                let episodes = scrape_episodes(&selected_show.id).await?;
-
-                if episodes.is_empty() {
-                    println!("No video links found for this show.");
-                    return Ok(());
-                }
-
-                match select_episode_with_fzf(&episodes)? {
-                    Some(selected_ep) => {
-                        println!("\nPreparing to play: {}", selected_ep.title);
-
-                        let current_watch = HistoryItem {
-                            show_id: selected_show.id.clone(),
-                            show_name: selected_show.name.clone(),
-                            episode_title: selected_ep.title.clone(),
-                            url: selected_ep.url.clone(),
-                        };
-
-                        if let Err(e) = save_history(current_watch) {
-                            eprintln!("Warning: Failed to save history: {}", e);
-                        } else {
-                            println!("Progress saved to ~/.config/ani-movies/history.json!");
-                        }
-
-                        if let Err(e) = play_video(&selected_ep.url) {
-                            eprintln!("Failed to play video: {}", e);
-                        }
-                    }
-                    None => println!("\nEpisode selection canceled."),
-                }
+                handle_show(&selected_show.id, &selected_show.name, None).await?;
             }
-            None => {
-                println!("\nNo show was selected. Exiting...");
-            }
+            None => println!("\nNo show selected."),
         }
     } else {
-        eprintln!("Request failed with status code: {}", fetch.status());
+        eprintln!("Status code: {}", fetch.status());
     }
 
     Ok(())
@@ -327,14 +398,14 @@ async fn main() {
 
     if args.len() < 2 {
         eprintln!("Usage: {} <query>", args[0]);
-        eprintln!("       {} -c (to continue watching)", args[0]);
+        eprintln!("       {} -c", args[0]);
         std::process::exit(1);
     }
 
     let input = &args[1];
 
     if input == "-c" {
-        if let Err(e) = continue_watching() {
+        if let Err(e) = continue_watching().await {
             eprintln!("Application Error: {}", e);
         }
     } else {
