@@ -18,7 +18,6 @@ struct Body {
 struct Show {
     id: String,
     name: String,
-    image: String,
 }
 
 #[derive(Debug, Clone)]
